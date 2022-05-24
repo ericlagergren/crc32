@@ -57,13 +57,13 @@ func archUpdateIEEE(crc uint32, p []byte) uint32 {
 	if !hasCRC32 {
 		panic("arch-specific crc32 instruction for IEEE not available")
 	}
-	if hasPMULL && len(p) >= 192 {
-		n := len(p) - (len(p) % 192)
+	if hasPMULL && len(p) >= 64 {
+		n := len(p) &^ 15
 		crc = ^ieeePMULL(^crc, p[:n])
-		if n == len(p) {
-			return crc
-		}
 		p = p[n:]
+	}
+	if len(p) == 0 {
+		return crc
 	}
 	return ^ieeeUpdate(^crc, p)
 }

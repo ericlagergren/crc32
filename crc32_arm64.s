@@ -125,7 +125,7 @@ TEXT ·ieeePMULL(SB), NOSPLIT, $0-36
 
 #define tmp V24
 
-#define final V28
+#define poly V28
 #define k12 V29
 #define k34 V30
 #define k45 V31
@@ -158,24 +158,37 @@ TEXT ·ieeePMULL(SB), NOSPLIT, $0-36
 	MOVD  p+8(FP), p_ptr
 	MOVD  p_len+16(FP), remain
 
-	// k12 is taken from [dougallj].
-	VMOVQ $0x1821d8bc0, $0x12e958ac4, k12
+	// k12 is assigned inside either have12blocks or have4blocks.
 	VMOVQ $0x1751997d0, $0x0ccaa009e, k34
 	VMOVQ $0xccaa009e, $0x163cd6124, k45
-	VMOVQ $0x1f7011641, $0x1db710641, final
+	VMOVQ $0x1f7011641, $0x1db710641, poly
+
+	VEOR tmp.B16, tmp.B16, tmp.B16
+	VMOV value, tmp.S[0]
+
+	// Are there at least 12 blocks?
+	//
+	// Note that the two strides (12 and 4) are mutually
+	// exclusive since they require a different k12 value. Both
+	// paths reconnect for steps 2 and 3, though.
+	CMP $192, remain
+	BLO have4blocks
+
+	// We have at least 12 blocks, so process 12 at a time.
+have12blocks:
+	// k12 is taken from [dougallj].
+	VMOVQ $0x1821d8bc0, $0x12e958ac4, k12
 
 	VLD1.P 64(p_ptr), [v0.B16, v1.B16, v2.B16, v3.B16]
 	VLD1.P 64(p_ptr), [v4.B16, v5.B16, v6.B16, v7.B16]
 	VLD1.P 64(p_ptr), [v8.B16, v9.B16, v10.B16, v11.B16]
 
 	// XOR in the input: v0 ^= value
-	VEOR tmp.B16, tmp.B16, tmp.B16
-	VMOV value, tmp.S[0]
 	VEOR tmp.B16, v0.B16, v0.B16
 
 	SUB $192, remain
 	CMP $192, remain
-	BLO step1fold12to1
+	BLO fold12to1
 
 	// Step 1: iteratively fold by twelve.
 	//
@@ -189,7 +202,7 @@ TEXT ·ieeePMULL(SB), NOSPLIT, $0-36
 	//   |__________________XOR   |    |    |
 	//                       |    |    |    |
 	//                       v0   v1   v2   v3
-step1:
+reduceBy12:
 	VLD1.P 64(p_ptr), [r0.B16, r1.B16, r2.B16, r3.B16]
 	VLD1.P 64(p_ptr), [r4.B16, r5.B16, r6.B16, r7.B16]
 	VLD1.P 64(p_ptr), [r8.B16, r9.B16, r10.B16, r11.B16]
@@ -209,11 +222,11 @@ step1:
 
 	SUB $192, remain
 	CMP $191, remain
-	BHI step1
+	BHI reduceBy12
 
-	// Complete step 1 by folding the 12 chunks down into
-	// a single 128-bit chunk.
-step1fold12to1:
+	// Complete step 1 by folding the 12 blocks down into
+	// a single 128-bit block.
+fold12to1:
 	reduce(v0, v1, k34)
 	reduce(v0, v2, k34)
 	reduce(v0, v3, k34)
@@ -226,10 +239,46 @@ step1fold12to1:
 	reduce(v0, v10, k34)
 	reduce(v0, v11, k34)
 
+	// Are there any remaining singles?
+	CMP $16, remain
+	BLO step3
+	B   step2
+
+	// We have at least 4 blocks, so process 4 at a time.
+have4blocks:
+	VMOVQ $0x154442bd4, $0x1c6e41596, k12
+
+	VLD1.P 64(p_ptr), [v0.B16, v1.B16, v2.B16, v3.B16]
+
+	// XOR in the input: v0 ^= value
+	VEOR tmp.B16, v0.B16, v0.B16
+
+	SUB $64, remain
+	CMP $64, remain
+	BLO fold4to1
+
+reduceBy4:
+	VLD1.P 64(p_ptr), [r0.B16, r1.B16, r2.B16, r3.B16]
+
+	reduce(v0, r0, k12)
+	reduce(v1, r1, k12)
+	reduce(v2, r2, k12)
+	reduce(v3, r3, k12)
+
+	SUB $64, remain
+	CMP $63, remain
+	BHI reduceBy4
+
+fold4to1:
+	reduce(v0, v1, k34)
+	reduce(v0, v2, k34)
+	reduce(v0, v3, k34)
+
+	// Are there any remaining singles?
 	CMP $16, remain
 	BLO step3
 
-	// Step 2: Iteratively fold in the remaining 128-bit chunks.
+	// Step 2: Iteratively fold in the remaining 128-bit blocks.
 step2:
 	VLD1.P 16(p_ptr), [r0.B16]
 	reduce(v0, r0, k34)
@@ -253,23 +302,23 @@ step2:
 // Step 3: C(x) = R(x) xor T2(x) mod x^32
 // After step 3, the 32 high-order coefficients of C will be 0.
 step3:
-	VPMULL  k45.D1, x.D1, b.Q1   // b = x*k45
-	VEOR    c.B16, c.B16, c.B16  // c[1] = 0
-	VMOV    x.D[1], c.D[0]       // c[0] = x[1]
-	VEOR    b.B16, c.B16, a.B16  // a = b^c
-	VEOR    d.B16, d.B16, d.B16  // d = 0
-	VMOV    a.S[0], d.S[2]       // d[2] = a[0]
-	VMOV    a.S[1], a.S[0]       // a[0] = a[1]
-	VMOV    a.S[2], a.S[1]       // a[1] = a[2]
-	VMOV    a.B16, b.B16         // b = a
-	VPMULL2 d.D2, k45.D2, a.Q1   // a = d*k45
-	VEOR    a.B16, b.B16, a.B16  // a ^= b
-	VMOV    a.S[0], d.S[0]       // d[0] = a[0]
-	VPMULL  d.D1, final.D1, b.Q1 // b = d*final
-	VMOV    b.S[0], d.S[2]       // d[2] = b[0]
-	VMOV    a.B16, b.B16         // b = a
-	VPMULL2 d.D2, final.D2, a.Q1 // a = d*final
-	VEOR    a.B16, b.B16, a.B16  // a ^= b
+	VPMULL  k45.D1, x.D1, b.Q1  // b = x*k45
+	VEOR    c.B16, c.B16, c.B16 // c[1] = 0
+	VMOV    x.D[1], c.D[0]      // c[0] = x[1]
+	VEOR    b.B16, c.B16, a.B16 // a = b^c
+	VEOR    d.B16, d.B16, d.B16 // d = 0
+	VMOV    a.S[0], d.S[2]      // d[2] = a[0]
+	VMOV    a.S[1], a.S[0]      // a[0] = a[1]
+	VMOV    a.S[2], a.S[1]      // a[1] = a[2]
+	VMOV    a.B16, b.B16        // b = a
+	VPMULL2 d.D2, k45.D2, a.Q1  // a = d*k45
+	VEOR    a.B16, b.B16, a.B16 // a ^= b
+	VMOV    a.S[0], d.S[0]      // d[0] = a[0]
+	VPMULL  d.D1, poly.D1, b.Q1 // b = d*poly
+	VMOV    b.S[0], d.S[2]      // d[2] = b[0]
+	VMOV    a.B16, b.B16        // b = a
+	VPMULL2 d.D2, poly.D2, a.Q1 // a = d*poly
+	VEOR    a.B16, b.B16, a.B16 // a ^= b
 
 	VMOV  a.S[1], value
 	MOVWU value, ret+32(FP)
@@ -314,7 +363,7 @@ step3:
 
 #undef tmp
 
-#undef final
+#undef poly
 #undef k12
 #undef k34
 #undef k45
